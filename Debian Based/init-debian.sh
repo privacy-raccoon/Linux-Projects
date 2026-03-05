@@ -2,25 +2,29 @@
 set -euo pipefail
 
 # -------------------------
-# INFORMATION
-# -------------------------
-
-# Lynis (via CISOfy repo) is used for security auditing and rootkit checks.
-# rkhunter is available on Debian but Lynis is used here for consistency
-# with the Rocky Linux variant of this script.
-
-# -------------------------
-# Variables:
+# Global Variables
 # -------------------------
 
 username=""
 org_name=""
 SSH_Port=2222
-Sysctl_Config="/etc/sysctl.d/99-hardening.conf"
-SSH_Config="/etc/ssh/sshd_config.d/99-hardening.conf"
-Fail2ban_SSH_Config="/etc/fail2ban/jail.d/sshd.conf"
-Audit_Rules="/etc/audit/rules.d/99-hardening.rules"
-Shm_Dropin="/etc/systemd/system/dev-shm.mount.d/hardening.conf"
+use_containers=false
+
+# -------------------------
+# Global Constants
+# -------------------------
+
+readonly Sysctl_Config="/etc/sysctl.d/99-hardening.conf"
+readonly SSH_Config="/etc/ssh/sshd_config.d/99-hardening.conf"
+readonly Fail2ban_SSH_Config="/etc/fail2ban/jail.d/sshd.conf"
+readonly Audit_Rules="/etc/audit/rules.d/99-hardening.rules"
+readonly Shm_Dropin="/etc/systemd/system/dev-shm.mount.d/hardening.conf"
+readonly Module_Blacklist="/etc/modprobe.d/99-hardening.conf"
+readonly Sudoers_Drop="/etc/sudoers.d/99-hardening"
+readonly Umask_Profile="/etc/profile.d/hardening.sh"
+readonly Br_Netfilter_Conf="/etc/modules-load.d/br_netfilter.conf"
+readonly Journald_Config="/etc/systemd/journald.conf.d/99-hardening.conf"
+readonly Logrotate_Config="/etc/logrotate.d/hardening"
 
 # -------------------------
 # Functions
@@ -40,30 +44,15 @@ check_root() {
     fi
 }
 
-# Resolve the target username from $SUDO_USER or prompt if run directly as root.
-get_username() {
-    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        username="$SUDO_USER"
-    else
-        printf "Please enter your username: "
-        read -r username
-    fi
-    [ -n "$username" ] || die "Username cannot be empty."
-}
-
-# Warn and prompt to continue if AppArmor is not active.
-check_apparmor() {
-    if systemctl is-active --quiet apparmor 2>/dev/null; then
-        printf "AppArmor is active.\n"
-        return 0
-    fi
-    printf "WARNING: AppArmor is not active. It should be enabled for a hardened system.\n"
-    printf "Continuing without AppArmor active significantly reduces system security.\n\n"
-    printf "Would you like to continue anyway? (y/N): "
+# Require the user to confirm they have read the documentation before proceeding.
+accept_terms() {
+    printf "Please review init.md before running this script.\n"
+    printf "It contains a full description of every change this script makes.\n\n"
+    printf "Have you read the documentation and do you wish to continue? (y/N): "
     read -r choice
-    case "$choice" in
+    case "${choice}" in
         y|Y|yes|YES)
-            printf "Continuing without AppArmor active...\n"
+            printf "Proceeding with hardening.\n"
             ;;
         *)
             printf "Aborting.\n"
@@ -72,20 +61,76 @@ check_apparmor() {
     esac
 }
 
-# Confirm Debian 12 (Bookworm); warn and prompt to continue on any other OS.
+# Prompt for the target username.
+# Loops until a valid, existing username is provided or the user aborts.
+get_username() {
+    while true; do
+        printf "Please enter your username (or 'abort' to exit): "
+        read -r username
+        if [ -z "${username}" ]; then
+            printf "Username cannot be empty.\n"
+        elif [ "${username}" = "abort" ]; then
+            printf "Aborting.\n"
+            exit 1
+        elif ! id "${username}" &>/dev/null; then
+            printf "User '%s' does not exist on this system.\n" "${username}"
+        elif [ "$(id -u "${username}")" -lt 1000 ]; then
+            printf "User '%s' is a system account and cannot be used.\n" "${username}"
+        else
+            break
+        fi
+    done
+}
+
+# Warn and prompt to continue if AppArmor is not active.
+# Debian uses AppArmor for mandatory access control instead of SELinux.
+check_apparmor() {
+    if systemctl is-active apparmor &>/dev/null; then
+        printf "AppArmor is active.\n"
+        return 0
+    fi
+    printf "WARNING: AppArmor is not active. It should be running on a hardened system.\n"
+    printf "AppArmor provides mandatory access control to confine processes to minimum required access.\n\n"
+    printf "Options:\n"
+    printf "  enable   Enable and start AppArmor\n"
+    printf "  skip     Continue without AppArmor (not recommended)\n"
+    printf "  abort    Exit the script\n"
+    printf "> "
+    read -r choice
+    case "${choice}" in
+        enable)
+            systemctl enable apparmor --now
+            printf "AppArmor enabled.\n"
+            ;;
+        skip)
+            printf "Continuing without AppArmor...\n"
+            ;;
+        *)
+            printf "Aborting.\n"
+            exit 1
+            ;;
+    esac
+}
+
+# Confirm Debian 13. Warn and prompt to continue on any other OS.
 check_os() {
-    if grep -q "^ID=debian" /etc/os-release 2>/dev/null && \
-       grep -q "^VERSION_ID=\"12\"" /etc/os-release 2>/dev/null; then
-        printf "Welcome %s, thanks for running this neat script.\n" "$username"
+    local id version_id
+    # shellcheck disable=SC1091
+    id=$(. /etc/os-release 2>/dev/null && printf "%s" "${ID}")
+    # shellcheck disable=SC1091,SC2153
+    version_id=$(. /etc/os-release 2>/dev/null && printf "%s" "${VERSION_ID}")
+    if [ "${id}" = "debian" ] && [ "${version_id}" = "13" ]; then
+        printf "Welcome %s, thanks for running this neat script.\n" "${username}"
     else
-        printf "WARNING: This operating system is NOT Debian 12 (Bookworm).\n"
-        printf "This script was designed specifically for Debian 12.\n"
-        printf "It may work on other Debian-based systems, but there are no guarantees.\n\n"
+        printf "WARNING: This operating system is NOT Debian 13 (Trixie).\n"
+        printf "This script was designed specifically for Debian 13.\n"
+        printf "It may work on other Debian-based systems, but there are no guarantees.\n"
+        printf "Do not attempt to run this script on non-Debian based systems.\n\n"
 
         printf "Would you like to continue anyway? (y/N): "
         read -r choice
 
-        case "$choice" in
+        case "${choice}" in
             y|Y|yes|YES)
                 printf "Continuing despite OS mismatch...\n"
                 ;;
@@ -97,18 +142,23 @@ check_os() {
     fi
 }
 
-# Warn and prompt to continue if no LUKS-encrypted volumes are detected.
+# Warn and prompt to continue if no supported disk encryption is detected.
+# Checks for LUKS (dm-crypt) and ZFS native encryption.
 check_disk_encryption() {
     printf "Checking for disk encryption...\n"
     if lsblk -o TYPE 2>/dev/null | grep -q "^crypt$"; then
         printf "Disk encryption detected (LUKS).\n"
         return 0
     fi
-    printf "WARNING: No LUKS-encrypted volumes detected on this system.\n"
+    if command -v zfs &>/dev/null && zfs list -H -o encryption 2>/dev/null | grep -qEv "^(off|-)$"; then
+        printf "Disk encryption detected (ZFS native encryption).\n"
+        return 0
+    fi
+    printf "WARNING: No disk encryption detected.\n"
     printf "Running this hardening script without disk encryption leaves data at rest unprotected.\n\n"
     printf "Would you like to continue anyway? (y/N): "
     read -r choice
-    case "$choice" in
+    case "${choice}" in
         y|Y|yes|YES)
             printf "Continuing without disk encryption...\n"
             ;;
@@ -124,11 +174,11 @@ check_disk_encryption() {
 check_ssh_key() {
     local auth_keys="/home/${username}/.ssh/authorized_keys"
     while true; do
-        if [ -s "$auth_keys" ]; then
-            printf "SSH authorized_keys found for %s.\n" "$username"
+        if [ -s "${auth_keys}" ]; then
+            printf "SSH authorized_keys found for %s.\n" "${username}"
             return 0
         fi
-        printf "WARNING: No SSH authorized_keys found for %s at %s.\n" "$username" "$auth_keys"
+        printf "WARNING: No SSH authorized_keys found for %s at %s.\n" "${username}" "${auth_keys}"
         printf "Disabling password authentication without a key will lock you out.\n\n"
         printf "Options:\n"
         printf "  [Enter]  Add your key now, then press Enter to check again\n"
@@ -136,7 +186,7 @@ check_ssh_key() {
         printf "  abort    Exit the script\n"
         printf "> "
         read -r choice
-        case "$choice" in
+        case "${choice}" in
             skip)
                 printf "Continuing without confirmed SSH key...\n"
                 return 0
@@ -152,35 +202,94 @@ check_ssh_key() {
     done
 }
 
-# Optionally override the default SSH port; validates the chosen port is not 22.
+# Check for a bootloader password and offer to set one if absent.
+# On Debian, uses grub-mkpasswd-pbkdf2 + /etc/grub.d/40_custom instead of grub2-setpassword.
+check_grub_password() {
+    if bootctl is-installed &>/dev/null; then
+        printf "systemd-boot detected. Bootloader passwords are not supported.\n"
+        printf "Ensure UEFI Secure Boot is enabled for equivalent boot-time protection.\n"
+        printf "\nPress Enter to continue...\n"
+        read -r
+        return 0
+    fi
+
+    if grep -q "password_pbkdf2" /etc/grub.d/40_custom 2>/dev/null || \
+       grep -q "password_pbkdf2" /boot/grub/grub.cfg 2>/dev/null; then
+        printf "GRUB2 bootloader password is set.\n"
+        return 0
+    fi
+    printf "WARNING: No GRUB2 bootloader password is set.\n"
+    printf "Without one, anyone with console access can edit boot entries or boot\n"
+    printf "to single-user mode and get a root shell, bypassing all other hardening.\n\n"
+    printf "Would you like to set a GRUB password now? (y/N): "
+    read -r choice
+    case "${choice}" in
+        y|Y|yes|YES)
+            printf "You will be prompted to enter and confirm your GRUB password.\n"
+            local tmpfile
+            tmpfile=$(mktemp)
+            grub-mkpasswd-pbkdf2 | tee "${tmpfile}"
+            local grub_hash
+            grub_hash=$(awk '/PBKDF2 hash/ {print $NF}' "${tmpfile}")
+            rm -f "${tmpfile}"
+            if [ -n "${grub_hash}" ]; then
+                printf "\nset superusers=\"root\"\npassword_pbkdf2 root %s\n" "${grub_hash}" \
+                    >> /etc/grub.d/40_custom
+                chmod 0700 /etc/grub.d/40_custom
+                update-grub
+                printf "GRUB password configured and grub.cfg updated.\n"
+            else
+                printf "WARNING: Could not capture the GRUB hash.\n"
+                printf "Run 'grub-mkpasswd-pbkdf2' manually and add the result to /etc/grub.d/40_custom.\n"
+            fi
+            ;;
+        *)
+            printf "Skipping GRUB password. Console access to this VM is not restricted.\n"
+            ;;
+    esac
+}
+
+# Optionally override the default SSH port; validates the chosen port is outside the well-known range (0-1023).
 configure_ssh_port() {
     printf "This script configures SSH on an alternative port as a basic security option. By default it is %s.\n" "${SSH_Port}"
-    printf "Do you want to use a different port than %s for SSH? (y/N): " "${SSH_Port}"
+    printf "The default option is fine, but still a well known alternative port.\n\n"
+    printf "Options:\n"
+    printf "  [Enter]  Keep default (%s)\n" "${SSH_Port}"
+    printf "  random   Generate a random port\n"
+    printf "  custom   Enter a custom port\n"
+    printf "> "
     read -r choice
-    case "$choice" in
-        y|Y|yes|YES)
+    case "${choice}" in
+        random)
+            SSH_Port=$(shuf -i 1024-65535 -n 1)
+            printf "Random port selected: %s\n" "${SSH_Port}"
+            ;;
+        custom)
             while true; do
-                printf "Please enter your preferred SSH port: "
+                printf "Please enter your preferred SSH port (1024-65535): "
                 read -r SSH_Port
-                if ! [[ "${SSH_Port}" =~ ^[0-9]+$ ]] || [ "${SSH_Port}" -lt 1 ] || [ "${SSH_Port}" -gt 65535 ]; then
-                    printf "Invalid port number. Must be between 1 and 65535.\n"
-                elif [ "${SSH_Port}" -eq 22 ]; then
-                    printf "Port 22 is not allowed. Please choose a different port.\n"
+                if ! [[ "${SSH_Port}" =~ ^[0-9]+$ ]] || [ "${SSH_Port}" -gt 65535 ]; then
+                    printf "Invalid port number. Must be between 1024 and 65535.\n"
+                elif [ "${SSH_Port}" -le 1023 ]; then
+                    printf "Well-known ports (0-1023) are not allowed. Please choose a port between 1024 and 65535.\n"
                 else
                     break
                 fi
             done
             ;;
+        *)
+            printf "Keeping default port.\n"
+            ;;
     esac
-    printf "Continuing with %s for SSH.\n" "${SSH_Port}"
+    printf "Continuing with SSH port %s.\n" "${SSH_Port}"
 }
 
 # Prompt for the organization name used in the login banner.
 get_org_name() {
     while true; do
-        printf "Please enter the name of the organization that owns this server: "
+        printf "Please enter the name of the organization or person that owns this server: "
         read -r org_name
-        if [ -z "$org_name" ]; then
+        if [ -z "${org_name}" ]; then
             printf "Organization name cannot be empty.\n"
         else
             break
@@ -207,14 +316,9 @@ EOF
     cp /etc/issue.net /etc/issue
 }
 
-# Add the CISOfy repository so Lynis can be installed via apt.
+# Lynis is available in the Debian 13 main repository; no additional repository required.
 configure_lynis_repo() {
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://packages.cisofy.com/keys/cisofy-software-public.key \
-        | gpg --dearmor -o /etc/apt/keyrings/cisofy-lynis.gpg
-    cat <<EOF > /etc/apt/sources.list.d/lynis.list
-deb [signed-by=/etc/apt/keyrings/cisofy-lynis.gpg arch=all] https://packages.cisofy.com/community/lynis/deb/ stable main
-EOF
+    printf "Lynis is available in the Debian 13 main repository; no additional repository required.\n"
 }
 
 # Update the system and install security and convenience packages.
@@ -224,28 +328,37 @@ install_packages() {
     apt-get -y upgrade
 
     printf "Installing security packages.\n"
+    printf "rkhunter and tripwire have limited availability on Debian 13.\n"
+    printf "Lynis and AIDE are used instead for security auditing and integrity monitoring.\n"
+    printf "\nPress Enter to begin package installation...\n"
+    read -r
     apt-get -y install \
-        "linux-headers-$(uname -r)" qemu-guest-agent \
         unattended-upgrades apt-listchanges \
-        ufw \
         fail2ban \
-        auditd audispd-plugins aide lynis \
-        libpam-pwquality \
-        chrony \
-        apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra
+        auditd audispd-plugins \
+        aide aide-common \
+        lynis \
+        qemu-guest-agent \
+        ufw \
+        apparmor apparmor-utils \
+        libpam-pwquality
 
-    printf "Installing personal/convenience packages.\n"
+    printf "Installing convenience packages.\n"
     apt-get -y install \
-        python3 python3-pip \
-        git nmon fastfetch zsh ncdu wget nano
+        git nmon fastfetch zsh ncdu btop
 }
 
-# Configure unattended-upgrades to apply security updates, with optional automatic reboots.
+# Configure unattended-upgrades to apply security updates automatically.
+# Replaces dnf-automatic on RHEL.
 configure_auto_updates() {
+    if grep -q "# Hardening configured" /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null; then
+        printf "unattended-upgrades already configured, skipping.\n"
+        return 0
+    fi
     local reboot_policy
     printf "Should the system automatically reboot after security updates that require it? (y/N): "
     read -r choice
-    case "$choice" in
+    case "${choice}" in
         y|Y|yes|YES)
             reboot_policy="true"
             printf "Automatic reboots enabled when required by updates.\n"
@@ -257,25 +370,26 @@ configure_auto_updates() {
     esac
 
     printf "Configuring automatic security updates.\n"
-    cat <<EOF > /etc/apt/apt.conf.d/20auto-upgrades
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF
     cp /etc/apt/apt.conf.d/50unattended-upgrades \
-        /etc/apt/apt.conf.d/50unattended-upgrades.bak 2>/dev/null || true
+       /etc/apt/apt.conf.d/50unattended-upgrades.bak 2>/dev/null || true
     cat <<EOF > /etc/apt/apt.conf.d/50unattended-upgrades
+// Hardening configured
 Unattended-Upgrade::Allowed-Origins {
     "\${distro_id}:\${distro_codename}-security";
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "${reboot_policy}";
+Unattended-Upgrade::Automatic-Reboot-Time "02:00";
+EOF
+    cat <<EOF > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
 EOF
 }
 
-# Harden faillock: lock accounts after 5 failures, 10-minute unlock, applies to root.
+# Harden faillock and enable it in the Debian PAM stack.
+# Appends settings to faillock.conf and inserts pam_faillock into common-auth/common-account.
 configure_pam() {
     if grep -q "# Hardening overrides" /etc/security/faillock.conf; then
         printf "PAM faillock already configured, skipping.\n"
@@ -291,6 +405,23 @@ fail_interval = 900
 even_deny_root
 audit
 EOF
+
+    # Insert pam_faillock into the Debian common-auth PAM stack.
+    # Preauth goes before pam_unix.so; authfail goes immediately after.
+    local common_auth="/etc/pam.d/common-auth"
+    cp "${common_auth}" "${common_auth}.bak"
+    if ! grep -q "pam_faillock.so preauth" "${common_auth}"; then
+        sed -i '/pam_unix\.so/i auth\trequired\t\t\t\tpam_faillock.so preauth' "${common_auth}"
+        sed -i '/pam_unix\.so/a auth\t[default=die]\t\t\t\tpam_faillock.so authfail' "${common_auth}"
+    fi
+
+    # Add the pam_faillock account rule to common-account.
+    local common_account="/etc/pam.d/common-account"
+    cp "${common_account}" "${common_account}.bak"
+    if ! grep -q "pam_faillock.so" "${common_account}"; then
+        echo "account required    pam_faillock.so" >> "${common_account}"
+    fi
+
     grep -q "# Hardening overrides" /etc/security/faillock.conf || die "Failed to apply PAM faillock settings."
 }
 
@@ -310,6 +441,7 @@ EOF
 
 # Write a hardened sshd drop-in: key-only auth, no root login, restricted ciphers/MACs.
 configure_ssh() {
+    mkdir -p "$(dirname "${SSH_Config}")"
     cat <<EOF > "${SSH_Config}"
 Port ${SSH_Port}
 Banner /etc/issue.net
@@ -345,21 +477,18 @@ EOF
 configure_kernel_modules() {
     printf "Loading br_netfilter kernel module for container networking.\n"
     modprobe br_netfilter
-    echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
+    echo "br_netfilter" > "${Br_Netfilter_Conf}"
 }
 
-# Write kernel hardening and container networking tunables to a sysctl drop-in.
+# Write kernel hardening tunables to a sysctl drop-in.
+# Container/Kubernetes tunables are appended only if use_containers is true.
 configure_sysctl() {
+    local rp_filter=1
+    if "${use_containers}"; then
+        rp_filter=2
+    fi
+
     cat <<EOF > "${Sysctl_Config}"
-# Required for container networking (Docker, K3s, K8s)
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-
-# Required for Kubernetes CNI networking (all CNI plugins depend on this)
-# br_netfilter module must be loaded before these take effect (see configure_kernel_modules)
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-
 net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
@@ -371,19 +500,19 @@ net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
-# rp_filter=2 (loose mode). Some CNI plugins (e.g. Calico) use asymmetric routing
-# and may require rp_filter=0 on specific interfaces. If pod networking misbehaves,
-# check this setting first.
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+
+# rp_filter=1 (strict) for standalone servers. Set to 2 (loose) on container hosts
+# because some CNI plugins (e.g. Calico) use asymmetric routing. Set automatically
+# based on whether container workloads were selected.
+net.ipv4.conf.all.rp_filter = ${rp_filter}
+net.ipv4.conf.default.rp_filter = ${rp_filter}
+
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_messages = 1
 net.ipv4.tcp_rfc1337 = 1
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
-# Disable acceptance of IPv6 router advertisements — a rogue RA can silently
-# reroute all traffic on the local network segment
 net.ipv6.conf.all.accept_ra = 0
 net.ipv6.conf.default.accept_ra = 0
 fs.suid_dumpable = 0
@@ -391,9 +520,20 @@ kernel.kptr_restrict = 2
 kernel.randomize_va_space = 2
 kernel.dmesg_restrict = 1
 kernel.sysrq = 0
-# Prevent unprivileged processes from attaching a debugger to processes they
-# don't own. Critical on a container host where many UIDs share the same kernel.
+# Prevent unprivileged processes from attaching a debugger to processes they don't own.
 kernel.yama.ptrace_scope = 1
+EOF
+
+    if "${use_containers}"; then
+        cat <<'EOF' >> "${Sysctl_Config}"
+# Required for container networking (Docker, K3s, K8s)
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# Required for Kubernetes CNI networking (all CNI plugins depend on this)
+# br_netfilter module must be loaded before these take effect (see configure_kernel_modules)
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
 
 # Container and Kubernetes operational tunables
 # K8s watches many files per pod; defaults are too low on busy nodes
@@ -405,92 +545,100 @@ vm.max_map_count = 262144
 kernel.panic = 10
 kernel.panic_on_oops = 1
 EOF
+    fi
 }
 
 # Optionally open firewall ports for Docker, K3s single-node, or K3s/K8s multi-node.
+# Uses ufw instead of firewalld (Debian default).
 configure_container_firewall() {
     printf "Will this server run containerized workloads? (y/N): "
     read -r choice
-    case "$choice" in
-        y|Y|yes|YES) ;;
-        *) return 0 ;;
-    esac
-
-    printf "Select workload type:\n"
-    printf "  1) Docker standalone\n"
-    printf "  2) K3s single-node\n"
-    printf "  3) K3s/K8s multi-node (server/control-plane)\n"
-    printf "  4) K3s/K8s multi-node (agent/worker)\n"
-    printf "> "
-    read -r workload
-
-    case "$workload" in
-        1)
-            printf "NOTE: Docker bypasses ufw by writing iptables rules directly.\n"
-            printf "Ports exposed via -p will be publicly reachable regardless of ufw rules.\n"
-            printf "See after_first_login.txt for mitigation options.\n"
-            ;;
-        2)
-            ufw allow 6443/tcp    # K8s API server
-            ufw allow 10250/tcp   # Kubelet
-            ufw allow 8472/udp    # Flannel VXLAN
-            ufw allow 51820/udp   # WireGuard (K3s default)
-            printf "Opened K3s single-node ports (6443, 10250, 8472/udp, 51820/udp).\n"
-            ;;
-        3)
-            ufw allow 6443/tcp         # K8s API server
-            ufw allow 10250/tcp        # Kubelet
-            ufw allow 8472/udp         # Flannel VXLAN
-            ufw allow 51820/udp        # WireGuard
-            ufw allow 2379:2380/tcp    # etcd (HA)
-            ufw allow 30000:32767/tcp  # NodePort range
-            printf "Opened K3s/K8s control-plane ports.\n"
-            ;;
-        4)
-            ufw allow 10250/tcp        # Kubelet
-            ufw allow 8472/udp         # Flannel VXLAN
-            ufw allow 51820/udp        # WireGuard
-            ufw allow 30000:32767/tcp  # NodePort range
-            printf "Opened K3s/K8s worker node ports.\n"
+    case "${choice}" in
+        y|Y|yes|YES)
+            use_containers=true
+            printf "Select workload type:\n"
+            printf "  1) Docker standalone\n"
+            printf "  2) K3s single-node\n"
+            printf "  3) K3s/K8s multi-node (server/control-plane)\n"
+            printf "  4) K3s/K8s multi-node (agent/worker)\n"
+            printf "> "
+            read -r workload
+            case "${workload}" in
+                1)
+                    printf "NOTE: Docker bypasses ufw by writing iptables rules directly.\n"
+                    printf "Ports exposed via -p will be publicly reachable regardless of ufw rules.\n"
+                    printf "See after_first_login.txt for mitigation options.\n"
+                    printf "Press Enter to continue...\n"
+                    read -r
+                    ;;
+                2)
+                    ufw allow 6443/tcp comment 'K8s API server'
+                    ufw allow 10250/tcp comment 'Kubelet'
+                    ufw allow 8472/udp comment 'Flannel VXLAN'
+                    ufw allow 51820/udp comment 'WireGuard (K3s default)'
+                    printf "Opened K3s single-node ports (6443, 10250, 8472/udp, 51820/udp).\n"
+                    ;;
+                3)
+                    ufw allow 6443/tcp comment 'K8s API server'
+                    ufw allow 10250/tcp comment 'Kubelet'
+                    ufw allow 8472/udp comment 'Flannel VXLAN'
+                    ufw allow 51820/udp comment 'WireGuard'
+                    ufw allow 2379:2380/tcp comment 'etcd (HA)'
+                    ufw allow 30000:32767/tcp comment 'NodePort range'
+                    printf "Opened K3s/K8s control-plane ports.\n"
+                    ;;
+                4)
+                    ufw allow 10250/tcp comment 'Kubelet'
+                    ufw allow 8472/udp comment 'Flannel VXLAN'
+                    ufw allow 51820/udp comment 'WireGuard'
+                    ufw allow 30000:32767/tcp comment 'NodePort range'
+                    printf "Opened K3s/K8s worker node ports.\n"
+                    ;;
+                *)
+                    printf "Unrecognised option, no container ports opened. Open them manually with ufw.\n"
+                    ;;
+            esac
             ;;
         *)
-            printf "Unrecognised option, no container ports opened. Open them manually with ufw.\n"
+            return 0
             ;;
     esac
 }
 
-# Reset ufw to a deny-all default, open the SSH port, and enable the firewall.
+# Configure ufw: default deny incoming, open SSH port.
+# Replaces semanage + firewalld on RHEL. No SELinux port registration needed on Debian.
 configure_firewall() {
-    ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
-    ufw allow "${SSH_Port}/tcp"
+    ufw allow "${SSH_Port}/tcp" comment 'SSH'
     ufw --force enable
+    printf "ufw enabled: default deny incoming, SSH port %s opened.\n" "${SSH_Port}"
 }
 
 # Write a post-login reference guide to the user's home directory.
 write_post_login_guide() {
-    cat <<EOF > "/home/${username}/after_first_login.txt"
+    local guide="/home/${username}/after_first_login.txt"
+
+    cat <<EOF > "${guide}"
 # -------------------------
 # Oh-My-ZSH
 # -------------------------
+# Completely optional, but it's my personal favorite config.
+
 # Use "curl -fsSL" to download this script: https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh
 # Or just grab it from their website directly
 # Then run "sh -c /path/to/install.sh" and the following commands:
 sed -i 's/robbyrussell/ys/' ~/.zshrc
 sed -i 's/plugins=(git)/plugins=(colored-man-pages colorize cp safe-paste git)/' ~/.zshrc
 sed -i '/export ZSH="\$HOME\/.oh-my-zsh"/a\export PATH=\$PATH:/home/${username}/.local/bin' ~/.zshrc
+EOF
+
+    if "${use_containers}"; then
+        cat <<'EOF' >> "${guide}"
 
 # -------------------------
 # Container Workloads
 # -------------------------
-
-# K3s AppArmor policy:
-#   K3s includes built-in AppArmor support. Ensure apparmor and
-#   apparmor-profiles-extra are installed (done by this script).
-#   If AppArmor is denying K3s operations at runtime, check:
-#     aa-status
-#     journalctl -u k3s | grep -i apparmor
 
 # Docker + ufw WARNING:
 #   Docker writes iptables rules directly and BYPASSES ufw.
@@ -538,13 +686,14 @@ sed -i '/export ZSH="\$HOME\/.oh-my-zsh"/a\export PATH=\$PATH:/home/${username}/
 #   and bring down all running containers. Plan for this in your workload
 #   availability strategy, or disable auto-reboot and handle reboots manually.
 EOF
-    chown "${username}:" "/home/${username}/after_first_login.txt"
+    fi
+
+    chown "${username}:" "${guide}"
 }
 
-# Blacklist uncommon filesystems with no legitimate server use (CIS 1.1.1).
+# Blacklist uncommon filesystems.
 configure_module_blacklist() {
-    cat <<EOF > /etc/modprobe.d/99-hardening.conf
-# Filesystems with no legitimate use on a server — blacklisted per CIS 1.1.1
+    cat <<EOF > "${Module_Blacklist}"
 install cramfs /bin/false
 install freevxfs /bin/false
 install jffs2 /bin/false
@@ -557,8 +706,6 @@ EOF
 
 # Mount /dev/shm with nodev, nosuid, noexec via a systemd drop-in override.
 configure_shm_hardening() {
-    # systemd manages /dev/shm via dev-shm.mount. An fstab entry is overridden
-    # by the systemd unit at boot, so we use a drop-in override instead.
     mkdir -p "$(dirname "$Shm_Dropin")"
     cat <<EOF > "${Shm_Dropin}"
 [Mount]
@@ -575,52 +722,49 @@ EOF
 
 # Add a sudoers drop-in that logs all sudo invocations to /var/log/sudo.log.
 configure_sudo_log() {
-    local sudoers_drop="/etc/sudoers.d/99-hardening"
-    if [ -f "$sudoers_drop" ]; then
+    if [ -f "$Sudoers_Drop" ]; then
         printf "sudo hardening drop-in already exists, skipping.\n"
         return 0
     fi
-    cat <<EOF > "$sudoers_drop"
+    cat <<EOF > "${Sudoers_Drop}"
 Defaults logfile=/var/log/sudo.log
 EOF
-    chmod 0440 "$sudoers_drop"
-    # Validate before leaving it in place
-    visudo -cf "$sudoers_drop" || { rm -f "$sudoers_drop"; die "sudo drop-in failed visudo check."; }
+    chmod 0440 "${Sudoers_Drop}"
+    visudo -cf "${Sudoers_Drop}" || { rm -f "${Sudoers_Drop}"; die "sudo drop-in failed visudo check."; }
     printf "sudo audit log configured at /var/log/sudo.log.\n"
 }
 
-# Restrict su to members of the sudo group via pam_wheel.
+# Restrict su to members of the wheel group via pam_wheel.
+# On Debian, the relevant group is 'sudo' but pam_wheel.so use_uid still works with 'wheel'.
+# Debian ships the pam_wheel line commented out — uncomment it.
 configure_su_restriction() {
     local su_pam="/etc/pam.d/su"
-    # Debian ships the pam_wheel line commented out — uncomment it.
-    # Uses group=sudo to match Debian's conventional admin group.
-    if grep -qE "^auth\s+required\s+pam_wheel" "$su_pam"; then
-        printf "su restriction already active, skipping.\n"
+    if grep -qE "^auth\s+required\s+pam_wheel" "${su_pam}"; then
+        printf "su wheel restriction already active, skipping.\n"
         return 0
     fi
-    cp "$su_pam" "${su_pam}.bak"
-    sed -i 's/^#\(auth\s\+required\s\+pam_wheel\.so\)/\1 group=sudo/' "$su_pam"
-    # If the sed didn't match (non-standard file), append it explicitly
-    if ! grep -qE "^auth\s+required\s+pam_wheel" "$su_pam"; then
-        echo "auth    required    pam_wheel.so group=sudo" >> "$su_pam"
+    cp "${su_pam}" "${su_pam}.bak"
+    sed -i 's/^#\(auth\s\+required\s\+pam_wheel\.so\)/\1/' "${su_pam}"
+    if ! grep -qE "^auth\s+required\s+pam_wheel" "${su_pam}"; then
+        echo "auth    required    pam_wheel.so" >> "${su_pam}"
     fi
-    printf "su restricted to sudo group.\n"
+    printf "su restricted to wheel group.\n"
 }
 
 # Configure auditd disk-space actions: email on low space, suspend on critical, keep logs.
 configure_auditd_conf() {
     local conf="/etc/audit/auditd.conf"
-    if grep -q "^space_left_action = email" "$conf" 2>/dev/null; then
+    if grep -q "^space_left_action = email" "${conf}" 2>/dev/null; then
         printf "auditd.conf already configured, skipping.\n"
         return 0
     fi
-    cp "$conf" "${conf}.bak"
+    cp "${conf}" "${conf}.bak"
     sed -i \
         -e 's/^space_left_action.*/space_left_action = email/' \
         -e 's/^admin_space_left_action.*/admin_space_left_action = suspend/' \
         -e 's/^action_mail_acct.*/action_mail_acct = root/' \
         -e 's/^max_log_file_action.*/max_log_file_action = keep_logs/' \
-        "$conf"
+        "${conf}"
     printf "auditd.conf disk space actions configured.\n"
 }
 
@@ -688,6 +832,37 @@ configure_auditd() {
 EOF
 }
 
+# Configure log retention to keep 6 months of logs across journald, auditd, and logrotate.
+configure_log_retention() {
+    mkdir -p "$(dirname "${Journald_Config}")"
+    cat <<EOF > "${Journald_Config}"
+[Journal]
+MaxRetentionSec=6month
+SystemMaxUse=500M
+SystemKeepFree=100M
+EOF
+
+    local auditd_conf="/etc/audit/auditd.conf"
+    sed -i 's/^max_log_file_action.*/max_log_file_action = rotate/' "${auditd_conf}"
+    if grep -q "^num_logs" "${auditd_conf}"; then
+        sed -i 's/^num_logs.*/num_logs = 26/' "${auditd_conf}"
+    else
+        echo "num_logs = 26" >> "${auditd_conf}"
+    fi
+
+    cat <<EOF > "${Logrotate_Config}"
+/var/log/sudo.log
+/var/log/fail2ban.log {
+    monthly
+    rotate 6
+    compress
+    missingok
+    notifempty
+}
+EOF
+    printf "Log retention configured: 6 months (journald, auditd, logrotate).\n"
+}
+
 # Enforce a 14-character minimum password length with digit, upper, lower, and symbol requirements.
 configure_pwquality() {
     if grep -q "# Hardening overrides" /etc/security/pwquality.conf; then
@@ -709,7 +884,7 @@ EOF
 
 # Set system-wide umask to 027 and enforce a 15-minute idle session timeout.
 configure_umask() {
-    cat <<EOF > /etc/profile.d/hardening.sh
+    cat <<EOF > "${Umask_Profile}"
 # Set restrictive default umask: owner rwx, group rx, others none.
 # NOTE: umask 027 can cause permission failures in container tooling (Helm,
 # K3s auto-deploy manifests, container build contexts) that expect world- or
@@ -750,10 +925,19 @@ EOF
 }
 
 # Exclude container/K8s paths from AIDE, build the initial database, and schedule daily checks.
+# On Debian, aide.conf lives at /etc/aide/aide.conf; falls back to /etc/aide.conf.
 configure_aide() {
-    # Exclude k3s/Kubernetes dynamic paths to prevent false positives
-    if ! grep -q "k3s / Kubernetes dynamic paths" /etc/aide/aide.conf; then
-        cat <<EOF >> /etc/aide/aide.conf
+    local aide_conf
+    if [ -f /etc/aide/aide.conf ]; then
+        aide_conf="/etc/aide/aide.conf"
+    elif [ -f /etc/aide.conf ]; then
+        aide_conf="/etc/aide.conf"
+    else
+        die "Cannot find AIDE configuration file."
+    fi
+
+    if ! grep -q "k3s / Kubernetes dynamic paths" "${aide_conf}"; then
+        cat <<EOF >> "${aide_conf}"
 
 # k3s / Kubernetes and Docker dynamic paths
 !/var/lib/rancher
@@ -768,17 +952,19 @@ configure_aide() {
 EOF
     fi
 
-    # Build initial database (may take a few minutes).
-    # Failure here is non-fatal — run 'aide --init' manually if needed.
     printf "Building AIDE database. This may take a few minutes...\n"
     if aide --init; then
-        mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+        # Debian may produce aide.db.new (no .gz) or aide.db.new.gz depending on config.
+        if [ -f /var/lib/aide/aide.db.new.gz ]; then
+            mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+        elif [ -f /var/lib/aide/aide.db.new ]; then
+            mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+        fi
         printf "AIDE database built successfully.\n"
     else
         printf "WARNING: AIDE database initialisation failed. Run 'aide --init' manually.\n"
     fi
 
-    # Systemd service for daily integrity checks
     cat <<EOF > /etc/systemd/system/aide-check.service
 [Unit]
 Description=AIDE integrity check
@@ -803,19 +989,25 @@ EOF
 }
 
 # Enable and start all configured services; mask avahi.
+# Uses Debian service names: ssh (not sshd), apt-daily timers (not dnf-automatic),
+# systemd-timesyncd (not chronyd), apparmor and ufw added.
 start_services() {
+    systemctl disable --now cockpit 2>/dev/null || true
+    rm -f /etc/motd.d/cockpit 2>/dev/null || true
     systemctl mask avahi-daemon 2>/dev/null || true
     sysctl --system
     systemctl daemon-reload
-    systemctl enable unattended-upgrades.service --now
-    systemctl enable chrony.service --now
-    systemctl enable auditd.service --now
+    systemctl enable apt-daily.timer --now
+    systemctl enable apt-daily-upgrade.timer --now
+    systemctl enable systemd-timesyncd --now
+    systemctl enable auditd --now
     systemctl enable aide-check.timer --now
     systemctl enable lynis-audit.timer --now
-    systemctl enable fail2ban.service --now
-    systemctl enable apparmor.service --now
-    systemctl restart ssh.service
-    systemctl is-active --quiet qemu-guest-agent 2>/dev/null && systemctl restart qemu-guest-agent || true
+    systemctl enable fail2ban --now
+    systemctl enable qemu-guest-agent --now
+    systemctl enable apparmor --now
+    systemctl enable ufw --now
+    systemctl restart ssh
 }
 
 # Print a summary of what was configured and where the key files were written.
@@ -824,28 +1016,32 @@ print_summary() {
     printf "=========================================================\n"
     printf "  Hardening complete\n"
     printf "=========================================================\n"
-    printf "  User:          %s\n" "$username"
-    printf "  Organization:  %s\n" "$org_name"
-    printf "  SSH port:      %s\n" "$SSH_Port"
+    printf "  User:          %s\n" "${username}"
+    printf "  Organization:  %s\n" "${org_name}"
+    printf "  SSH port:      %s\n" "${SSH_Port}"
     printf "\n"
     printf "  Key config files written:\n"
-    printf "    %s\n" "$SSH_Config"
-    printf "    %s\n" "$Sysctl_Config"
-    printf "    %s\n" "$Audit_Rules"
-    printf "    %s\n" "$Fail2ban_SSH_Config"
-    printf "    /etc/apt/apt.conf.d/20auto-upgrades\n"
-    printf "    /etc/apt/apt.conf.d/50unattended-upgrades\n"
-    printf "    /etc/modprobe.d/99-hardening.conf\n"
-    printf "    /etc/sudoers.d/99-hardening\n"
-    printf "    /etc/profile.d/hardening.sh\n"
-    printf "    /etc/modules-load.d/br_netfilter.conf\n"
-    printf "    %s\n" "$Shm_Dropin"
+    printf "    %s\n" "${SSH_Config}"
+    printf "    %s\n" "${Sysctl_Config}"
+    printf "    %s\n" "${Audit_Rules}"
+    printf "    %s\n" "${Fail2ban_SSH_Config}"
+    printf "    %s\n" "${Module_Blacklist}"
+    printf "    %s\n" "${Sudoers_Drop}"
+    printf "    %s\n" "${Umask_Profile}"
+    if "${use_containers}"; then
+        printf "    %s\n" "${Br_Netfilter_Conf}"
+    fi
+    printf "    %s\n" "${Shm_Dropin}"
+    printf "    %s\n" "${Journald_Config}"
+    printf "    %s\n" "${Logrotate_Config}"
     printf "\n"
     printf "  Backups created with .bak suffix for all modified files.\n"
     printf "  Run log saved to /var/log/hardening-*.log\n"
     printf "\n"
-    printf "  Next steps: /home/%s/after_first_login.txt\n" "$username"
+    printf "  Next steps: /home/%s/after_first_login.txt\n" "${username}"
     printf "=========================================================\n"
+    printf "\nPress Enter to exit...\n"
+    read -r
 }
 
 # -------------------------
@@ -855,11 +1051,13 @@ print_summary() {
 main() {
     exec > >(tee "/var/log/hardening-$(date +%Y%m%d-%H%M%S).log") 2>&1
     check_root
+    accept_terms
     check_disk_encryption
     get_username
     check_apparmor
     check_os
     check_ssh_key
+    check_grub_password
     configure_ssh_port
     get_org_name
     configure_banner
@@ -871,14 +1069,17 @@ main() {
     configure_fail2ban
     configure_ssh
     configure_module_blacklist
-    configure_kernel_modules
+    configure_container_firewall
+    if "${use_containers}"; then
+        configure_kernel_modules
+    fi
     configure_sysctl
     configure_auditd_conf
     configure_auditd
+    configure_log_retention
     configure_umask
     configure_lynis
     configure_firewall
-    configure_container_firewall
     configure_shm_hardening
     configure_sudo_log
     configure_su_restriction
