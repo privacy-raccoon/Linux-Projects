@@ -30,7 +30,7 @@ The script logs all output to `/var/log/hardening-<timestamp>.log`.
 
 ### Pre-flight checks
 
-Before making any changes, the script runs the following checks in order. Each one will prompt you to continue, fix the issue, or abort.
+Before making any changes, the script runs the following checks in order. Each one will prompt you to continue, fix the issue (if possible), or abort.
 
 | Check  | What it does  |
 |-----------------|------------------------------------------------------------|
