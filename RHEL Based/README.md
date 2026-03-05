@@ -36,7 +36,7 @@ This is the most important step. All partition and encryption decisions are made
 
 ### Partition scheme
 
-When prompted for a partition scheme, select **LVM**. This places all logical volumes inside a single LUKS-encrypted container — one passphrase unlocks the entire system at boot.
+When prompted for a partition scheme, select **LVM**.
 
 Check **Encrypt my data** and set a strong passphrase when prompted. This passphrase is required at every boot. Store it securely.
 
