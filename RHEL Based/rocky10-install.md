@@ -1,8 +1,8 @@
 # Rocky Linux 10 — Secure Installation Guide
 
 This guide covers the disk layout and encryption decisions that must be made
-at install time via the Anaconda graphical installer. These cannot be
-configured safely post-boot. After installation, run `init.sh` to complete
+at install time via the graphical installer. These cannot be
+configured post-boot. After installation, run `init.sh` to complete
 hardening.
 
 ---
@@ -10,7 +10,8 @@ hardening.
 ## Prerequisites
 
 - Rocky Linux 10 installation media (ISO verified against official checksums)
-- UEFI firmware with Secure Boot available (recommended)
+- UEFI firmware with Secure Boot available (recommended). 
+-- BIOS firmware is fine if running in a VM with a properly secured hypervisor.
 - A clean disk — all existing data will be destroyed
 - 64 GiB disk assumed for the layouts below
 
@@ -46,22 +47,21 @@ passphrase is required at every boot. Store it securely.
 
 ### Recommended layout
 
-Use **ext4** for all partitions unless noted otherwise. Two layouts are
+Use **xfs** for all partitions unless noted otherwise. Two layouts are
 provided below based on intended workload — choose one before installing.
 
 #### Option A — Kubernetes / K3s workload (no swap)
 
-Kubernetes requires swap to be disabled. The space saved is redistributed
-to `/var`, which holds container images, kubelet state, and runtime data.
+Kubernetes requires swap to be disabled. The space saved is redistributed to `/var`, which holds container images, kubelet state, and runtime data. Be aware that you will see a warning during the configuration if you don't have swap space configured. You can safely ignore this warning and move forward.
 
 | Mount point | Filesystem  | Size     | Notes |
 |-------------|-------------|----------|-------|
 | `/boot/efi` | EFI (FAT32) | 600 MiB  | UEFI only; not encrypted |
-| `/boot`     | ext4        | 1 GiB    | Not encrypted; required for GRUB |
-| `/`         | ext4        | 20 GiB   | Encrypted via LVM container |
-| `/var`      | ext4        | 25 GiB   | Encrypted; sized for container images and logs |
-| `/home`     | ext4        | 12 GiB   | Encrypted |
-| `/tmp`      | ext4        | 5 GiB    | Encrypted |
+| `/boot`     | xfs        | 1 GiB    | Not encrypted; required for GRUB |
+| `/`         | xfs        | 20 GiB   | Encrypted via LVM container |
+| `/var`      | xfs        | 25 GiB   | Encrypted; sized for container images and logs |
+| `/home`     | xfs        | 12 GiB   | Encrypted |
+| `/tmp`      | xfs        | 5 GiB    | Encrypted |
 
 > After installation, disable swap permanently if the installer created one:
 > `swapoff -a` and remove any swap entries from `/etc/fstab`.
@@ -71,11 +71,11 @@ to `/var`, which holds container images, kubelet state, and runtime data.
 | Mount point | Filesystem  | Size     | Notes |
 |-------------|-------------|----------|-------|
 | `/boot/efi` | EFI (FAT32) | 600 MiB  | UEFI only; not encrypted |
-| `/boot`     | ext4        | 1 GiB    | Not encrypted; required for GRUB |
-| `/`         | ext4        | 15 GiB   | Encrypted via LVM container |
-| `/var`      | ext4        | 15 GiB   | Encrypted |
-| `/home`     | ext4        | 15 GiB   | Encrypted |
-| `/tmp`      | ext4        | 5 GiB    | Encrypted |
+| `/boot`     | xfs        | 1 GiB    | Not encrypted; required for GRUB |
+| `/`         | xfs        | 15 GiB   | Encrypted via LVM container |
+| `/var`      | xfs        | 15 GiB   | Encrypted |
+| `/home`     | xfs        | 15 GiB   | Encrypted |
+| `/tmp`      | xfs        | 5 GiB    | Encrypted |
 | `swap`      | swap        | 8 GiB    | Encrypted |
 
 > `/boot` and `/boot/efi` sit outside the LUKS container and cannot be
@@ -84,7 +84,77 @@ to `/var`, which holds container images, kubelet state, and runtime data.
 
 ### Mount options
 
-For each volume, click **Modify** to set mount options. Apply the following:
+The Rocky Linux graphical installer does not expose a mount options field in
+the partitioning screen. Set these options post-installation by editing
+`/etc/fstab` (see **Section 9**).
+
+Click **Done**, review the change summary, and click **Accept Changes**.
+
+---
+
+## 3. KDUMP
+
+Unless otherwise needed, enable kdump and select "Automatic" for the
+`Kdump Memory Reservation` option.
+
+---
+
+## 4. Network and hostname
+
+1. Click **Network & Host Name**
+2. Set the hostname in the field at the bottom of the screen
+3. Configure a static IP here if you need it.
+4. Click **Done**
+
+---
+
+## 5. Installation Source
+
+If you are using the full DVD ISO installer, feel free to stick with it.
+Personally, I recommend to use `On the network` as the installation source
+in order to ensure the system installs with updated software.
+
+---
+
+## 6. Root account and user creation
+
+1. (optional) Click **Root Account** and select **Disable root account**
+   The `init.sh` hardening script requires a non-root wheel user; its SSH
+   config blocks root login entirely.
+   It may be beneficial to have access to the root user via console or `su` in the future. Use your best judgement for this decision.
+   If you do enable the root account, **do not** enable SSH login with a password for the root user.
+
+2. Click **User Creation** and create your primary user:
+   - Check **Make this user administrator** (adds to `wheel`)
+   - Set a strong password — SSH will be restricted to key-only auth
+     after `init.sh` runs
+
+---
+
+## 7. Software selection
+
+Select **Server** as the base environment and add no additional package
+groups. The Server selection includes the tooling that `init.sh` depends on
+(SELinux utilities, audit, policycoreutils, etc.) without pulling in
+unnecessary services.
+
+---
+
+## 8. Complete installation
+
+Click **Begin Installation**, wait for it to finish, then remove the
+installation media and reboot.
+
+At boot you will be prompted for the LUKS passphrase before the system
+continues loading.
+
+---
+
+## 9. Post-install verification
+
+### Set mount options in /etc/fstab
+
+Edit `/etc/fstab` and add the following options to the relevant entries:
 
 | Mount point | Mount options |
 |-------------|---------------|
@@ -96,52 +166,15 @@ For each volume, click **Modify** to set mount options. Apply the following:
 > home directories (Python virtualenvs, shell scripts, etc.) would break.
 > Apply it if your threat model warrants it.
 
-Click **Done**, review the change summary, and click **Accept Changes**.
+Apply without rebooting:
 
----
+```bash
+sudo mount -o remount /var
+sudo mount -o remount /home
+sudo mount -o remount /tmp
+```
 
-## 3. Network and hostname
-
-1. Click **Network & Host Name**
-2. Set the hostname in the field at the bottom of the screen
-3. Toggle the network interface on if you need it during installation
-4. Click **Done**
-
----
-
-## 4. Root account and user creation
-
-1. Click **Root Account** and select **Disable root account**
-   The `init.sh` hardening script requires a non-root wheel user; its SSH
-   config blocks root login entirely.
-
-2. Click **User Creation** and create your primary user:
-   - Check **Make this user administrator** (adds to `wheel`)
-   - Set a strong password — SSH will be restricted to key-only auth
-     after `init.sh` runs
-
----
-
-## 5. Software selection
-
-Select **Server** as the base environment and add no additional package
-groups. The Server selection includes the tooling that `init.sh` depends on
-(SELinux utilities, audit, policycoreutils, etc.) without pulling in
-unnecessary services.
-
----
-
-## 6. Complete installation
-
-Click **Begin Installation**, wait for it to finish, then remove the
-installation media and reboot.
-
-At boot you will be prompted for the LUKS passphrase before the system
-continues loading.
-
----
-
-## 7. Post-install verification
+### Verify partition layout and encryption
 
 After first login, verify the partition layout and encryption before running
 `init.sh`:
@@ -153,7 +186,7 @@ lsblk -o NAME,FSTYPE,MOUNTPOINT,SIZE
 # Confirm LUKS is active on the expected devices
 lsblk -o NAME,TYPE | grep crypt
 
-# Confirm mount options match what was configured
+# Confirm mount options were applied
 findmnt -o TARGET,OPTIONS /var /home /tmp
 
 # Kubernetes: confirm swap is off
@@ -165,7 +198,7 @@ Expected output from `lsblk` should show `crypt` type entries mapped to
 
 ---
 
-## 8. Run init.sh
+## 10. Run init.sh
 
 Transfer `init.sh` to the server and run it as your first post-boot step:
 

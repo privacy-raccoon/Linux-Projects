@@ -978,8 +978,8 @@ start_services() {
     systemctl enable aide-check.timer --now
     systemctl enable lynis-audit.timer --now
     systemctl enable fail2ban.service --now
+    systemctl enable qemu-guest-agent --now
     systemctl restart sshd.service
-    systemctl is-active --quiet qemu-guest-agent 2>/dev/null && systemctl restart qemu-guest-agent || true
 }
 
 # Print a summary of what was configured and where the key files were written.
