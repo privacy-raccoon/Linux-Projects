@@ -6,7 +6,6 @@ hardening.
 
 > Please note, if you read this document in plain text it might look very broken. The formatting is built for markdown editors and viewers.
 
-
 ---
 
 ## Prerequisites
@@ -167,7 +166,9 @@ lsblk -o NAME,FSTYPE,MOUNTPOINT,SIZE
 lsblk -o NAME,TYPE | grep crypt
 
 # Confirm mount options were applied
-findmnt -o TARGET,OPTIONS /var /home /tmp
+findmnt -o TARGET,OPTIONS /var 
+findmnt -o TARGET,OPTIONS /home 
+findmnt -o TARGET,OPTIONS /tmp
 
 # Kubernetes: confirm swap is off
 swapon --show
@@ -201,6 +202,8 @@ ssh-keygen -t ed25519
 ---
 
 ## 10. Run init.sh
+
+Review `init.md` to review what the script will do. Feel free to review the script as well, you wouldn't just run any random script off the internet without making sure it's safe, right?
 
 Transfer `init.sh` to the server and run it as your first post-boot step:
 

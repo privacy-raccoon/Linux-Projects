@@ -24,7 +24,7 @@ This guide covers Proxmox VM settings for a general use workload using the web G
 
 ## OS
 
-- Choose an appropriate ISO image that has already been uploaded to Proxmox. This guide recommends **RHEL/Rocky Linux 9** or later, **Debian 12** or later, or **Ubuntu 24.04.4 LTS** for Linux based servers at time of writing. 
+- Choose an appropriate ISO image that has already been uploaded to Proxmox. This guide recommends **RHEL/Rocky Linux 9** or later, **Debian 12** or later, or **Ubuntu 24.04.4 LTS** for Linux based servers at time of writing.
 - **RHEL/Rocky Linux 10**, **Debian 13**, and **Ubuntu 25.10** are still new enough at the time of writing that they may have unresolved quirks (such as EPEL 10 not having full parity with EPEL 9).
 
 ## System

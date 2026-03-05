@@ -8,6 +8,7 @@ set -euo pipefail
 username=""
 org_name=""
 SSH_Port=2222
+use_containers=false
 
 # -------------------------
 # Global Constants
@@ -43,30 +44,11 @@ check_root() {
     fi
 }
 
-# Display a summary of changes and require explicit acceptance before proceeding.
+# Require the user to confirm they have read the documentation before proceeding.
 accept_terms() {
-    printf "This script will make the following changes to this system:\n\n"
-    printf "  Packages\n"
-    printf "    Install fail2ban, auditd, AIDE, Lynis, and convenience utilities\n"
-    printf "    Enable automatic security updates via dnf-automatic\n\n"
-    printf "  SSH\n"
-    printf "    Disable password auth, restrict to key-only on a custom port\n"
-    printf "    Restrict ciphers, MACs, and key exchange algorithms\n\n"
-    printf "  System hardening\n"
-    printf "    Harden PAM faillock and password quality requirements\n"
-    printf "    Apply kernel sysctl hardening and container networking tunables\n"
-    printf "    Blacklist unused filesystem modules; harden /dev/shm\n"
-    printf "    Set umask 027 and enforce a 15-minute idle session timeout\n\n"
-    printf "  Firewall and access control\n"
-    printf "    Configure firewalld; register SSH port with SELinux\n"
-    printf "    Restrict su to wheel group; log all sudo invocations\n\n"
-    printf "  Auditing and monitoring\n"
-    printf "    Write auditd rules covering auth, privileges, identity, and containers\n"
-    printf "    Schedule daily AIDE integrity checks and Lynis security audits\n"
-    printf "    Set a 6 month default data retention for logs and audit files\n\n"
-    printf "These changes are intended for a fresh system. Running this script on a\n"
-    printf "production system without a prior snapshot or backup is not recommended.\n\n"
-    printf "Do you accept and wish to continue? (y/N): "
+    printf "Please review init.md before running this script.\n"
+    printf "It contains a full description of every change this script makes.\n\n"
+    printf "Have you read the documentation and do you wish to continue? (y/N): "
     read -r choice
     case "${choice}" in
         y|Y|yes|YES)
@@ -79,13 +61,9 @@ accept_terms() {
     esac
 }
 
-# Resolve the target username from $SUDO_USER or prompt if run directly as root.
+# Prompt for the target username.
 # Loops until a valid, existing username is provided or the user aborts.
 get_username() {
-    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-        username="${SUDO_USER}"
-        return 0
-    fi
     while true; do
         printf "Please enter your username (or 'abort' to exit): "
         read -r username
@@ -94,10 +72,12 @@ get_username() {
         elif [ "${username}" = "abort" ]; then
             printf "Aborting.\n"
             exit 1
-        elif id "${username}" &>/dev/null; then
-            break
-        else
+        elif ! id "${username}" &>/dev/null; then
             printf "User '%s' does not exist on this system.\n" "${username}"
+        elif [ "$(id -u "${username}")" -lt 1000 ]; then
+            printf "User '%s' is a system account and cannot be used.\n" "${username}"
+        else
+            break
         fi
     done
 }
@@ -240,6 +220,8 @@ check_grub_password() {
     if bootctl is-installed &>/dev/null; then
         printf "systemd-boot detected. Bootloader passwords are not supported.\n"
         printf "Ensure UEFI Secure Boot is enabled for equivalent boot-time protection.\n"
+        printf "\nPress Enter to continue...\n"
+        read -r
         return 0
     fi
 
@@ -356,18 +338,16 @@ install_packages() {
     dnf -y update
 
     printf "Installing security packages.\n"
-    printf "rkhunter and tripwire are not yet available in EPEL 10."
-    printf "Lynis (via CISOfy repo) and AIDE are used instead for security auditing and rootkit checks."
+    printf "rkhunter and tripwire are not yet available in EPEL 10.\n"
+    printf "Lynis (via CISOfy repo) and AIDE are used instead for security auditing and rootkit checks.\n"
+    printf "\nPress Enter to begin package installation...\n"
+    read -r
     dnf -y install \
-        kernel-headers qemu-guest-agent util-linux-user dnf-automatic \
-        fail2ban \
-        audit audispd-plugins aide lynis \
-        container-selinux
+        dnf-automatic fail2ban audit audispd-plugins aide lynis qemu-guest-agent
 
-    printf "Installing personal/convenience packages.\n"
+    printf "Installing convenience packages.\n"
     dnf -y install \
-        python3 python3-pip \
-        git nmon fastfetch zsh ncdu wget nano btop
+        git nmon fastfetch zsh ncdu btop
 }
 
 # Configure dnf-automatic to apply security updates, with optional automatic reboots.
@@ -474,18 +454,15 @@ configure_kernel_modules() {
     echo "br_netfilter" > "${Br_Netfilter_Conf}"
 }
 
-# Write kernel hardening and container networking tunables to a sysctl drop-in.
+# Write kernel hardening tunables to a sysctl drop-in.
+# Container/Kubernetes tunables are appended only if use_containers is true.
 configure_sysctl() {
+    local rp_filter=1
+    if "${use_containers}"; then
+        rp_filter=2
+    fi
+
     cat <<EOF > "${Sysctl_Config}"
-# Required for container networking (Docker, K3s, K8s)
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-
-# Required for Kubernetes CNI networking (all CNI plugins depend on this)
-# br_netfilter module must be loaded before these take effect (see configure_kernel_modules)
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-
 net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
@@ -497,19 +474,19 @@ net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
-# rp_filter=2 (loose mode). Some CNI plugins (e.g. Calico) use asymmetric routing
-# and may require rp_filter=0 on specific interfaces. If pod networking misbehaves,
-# check this setting first.
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+
+# rp_filter=1 (strict) for standalone servers. Set to 2 (loose) on container hosts
+# because some CNI plugins (e.g. Calico) use asymmetric routing. Set automatically
+# based on whether container workloads were selected.
+net.ipv4.conf.all.rp_filter = ${rp_filter}
+net.ipv4.conf.default.rp_filter = ${rp_filter}
+
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_messages = 1
 net.ipv4.tcp_rfc1337 = 1
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
-# Disable acceptance of IPv6 router advertisements — a rogue RA can silently
-# reroute all traffic on the local network segment
 net.ipv6.conf.all.accept_ra = 0
 net.ipv6.conf.default.accept_ra = 0
 fs.suid_dumpable = 0
@@ -517,9 +494,20 @@ kernel.kptr_restrict = 2
 kernel.randomize_va_space = 2
 kernel.dmesg_restrict = 1
 kernel.sysrq = 0
-# Prevent unprivileged processes from attaching a debugger to processes they
-# don't own. Critical on a container host where many UIDs share the same kernel.
+# Prevent unprivileged processes from attaching a debugger to processes they don't own.
 kernel.yama.ptrace_scope = 1
+EOF
+
+    if "${use_containers}"; then
+        cat <<'EOF' >> "${Sysctl_Config}"
+# Required for container networking (Docker, K3s, K8s)
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# Required for Kubernetes CNI networking (all CNI plugins depend on this)
+# br_netfilter module must be loaded before these take effect (see configure_kernel_modules)
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
 
 # Container and Kubernetes operational tunables
 # K8s watches many files per pod; defaults are too low on busy nodes
@@ -531,6 +519,7 @@ vm.max_map_count = 262144
 kernel.panic = 10
 kernel.panic_on_oops = 1
 EOF
+    fi
 }
 
 # Optionally open firewall ports for Docker, K3s single-node, or K3s/K8s multi-node.
@@ -538,49 +527,53 @@ configure_container_firewall() {
     printf "Will this server run containerized workloads? (y/N): "
     read -r choice
     case "${choice}" in
-        y|Y|yes|YES) ;;
-        *) return 0 ;;
-    esac
-
-    printf "Select workload type:\n"
-    printf "  1) Docker standalone\n"
-    printf "  2) K3s single-node\n"
-    printf "  3) K3s/K8s multi-node (server/control-plane)\n"
-    printf "  4) K3s/K8s multi-node (agent/worker)\n"
-    printf "> "
-    read -r workload
-
-    case "${workload}" in
-        1)
-            printf "NOTE: Docker bypasses firewalld by writing iptables rules directly.\n"
-            printf "Ports exposed via -p will be publicly reachable regardless of firewalld rules.\n"
-            printf "See after_first_login.txt for mitigation options.\n"
-            ;;
-        2)
-            firewall-cmd --add-port=6443/tcp --permanent   # K8s API server
-            firewall-cmd --add-port=10250/tcp --permanent  # Kubelet
-            firewall-cmd --add-port=8472/udp --permanent   # Flannel VXLAN
-            firewall-cmd --add-port=51820/udp --permanent  # WireGuard (K3s default)
-            printf "Opened K3s single-node ports (6443, 10250, 8472/udp, 51820/udp).\n"
-            ;;
-        3)
-            firewall-cmd --add-port=6443/tcp --permanent   # K8s API server
-            firewall-cmd --add-port=10250/tcp --permanent  # Kubelet
-            firewall-cmd --add-port=8472/udp --permanent   # Flannel VXLAN
-            firewall-cmd --add-port=51820/udp --permanent  # WireGuard
-            firewall-cmd --add-port=2379-2380/tcp --permanent  # etcd (HA)
-            firewall-cmd --add-port=30000-32767/tcp --permanent  # NodePort range
-            printf "Opened K3s/K8s control-plane ports.\n"
-            ;;
-        4)
-            firewall-cmd --add-port=10250/tcp --permanent  # Kubelet
-            firewall-cmd --add-port=8472/udp --permanent   # Flannel VXLAN
-            firewall-cmd --add-port=51820/udp --permanent  # WireGuard
-            firewall-cmd --add-port=30000-32767/tcp --permanent  # NodePort range
-            printf "Opened K3s/K8s worker node ports.\n"
+        y|Y|yes|YES)
+            use_containers=true
+            printf "Select workload type:\n"
+            printf "  1) Docker standalone\n"
+            printf "  2) K3s single-node\n"
+            printf "  3) K3s/K8s multi-node (server/control-plane)\n"
+            printf "  4) K3s/K8s multi-node (agent/worker)\n"
+            printf "> "
+            read -r workload
+            case "${workload}" in
+                1)
+                    printf "NOTE: Docker bypasses firewalld by writing iptables rules directly.\n"
+                    printf "Ports exposed via -p will be publicly reachable regardless of firewalld rules.\n"
+                    printf "See after_first_login.txt for mitigation options.\n"
+                    printf "Press Enter to continue...\n"
+                    read -r
+                    ;;
+                2)
+                    firewall-cmd --add-port=6443/tcp --permanent   # K8s API server
+                    firewall-cmd --add-port=10250/tcp --permanent  # Kubelet
+                    firewall-cmd --add-port=8472/udp --permanent   # Flannel VXLAN
+                    firewall-cmd --add-port=51820/udp --permanent  # WireGuard (K3s default)
+                    printf "Opened K3s single-node ports (6443, 10250, 8472/udp, 51820/udp).\n"
+                    ;;
+                3)
+                    firewall-cmd --add-port=6443/tcp --permanent   # K8s API server
+                    firewall-cmd --add-port=10250/tcp --permanent  # Kubelet
+                    firewall-cmd --add-port=8472/udp --permanent   # Flannel VXLAN
+                    firewall-cmd --add-port=51820/udp --permanent  # WireGuard
+                    firewall-cmd --add-port=2379-2380/tcp --permanent  # etcd (HA)
+                    firewall-cmd --add-port=30000-32767/tcp --permanent  # NodePort range
+                    printf "Opened K3s/K8s control-plane ports.\n"
+                    ;;
+                4)
+                    firewall-cmd --add-port=10250/tcp --permanent  # Kubelet
+                    firewall-cmd --add-port=8472/udp --permanent   # Flannel VXLAN
+                    firewall-cmd --add-port=51820/udp --permanent  # WireGuard
+                    firewall-cmd --add-port=30000-32767/tcp --permanent  # NodePort range
+                    printf "Opened K3s/K8s worker node ports.\n"
+                    ;;
+                *)
+                    printf "Unrecognised option, no container ports opened. Open them manually with firewall-cmd.\n"
+                    ;;
+            esac
             ;;
         *)
-            printf "Unrecognised option, no container ports opened. Open them manually with firewall-cmd.\n"
+            return 0
             ;;
     esac
 }
@@ -598,7 +591,9 @@ configure_firewall() {
 
 # Write a post-login reference guide to the user's home directory.
 write_post_login_guide() {
-    cat <<EOF > "/home/${username}/after_first_login.txt"
+    local guide="/home/${username}/after_first_login.txt"
+
+    cat <<EOF > "${guide}"
 # -------------------------
 # Oh-My-ZSH
 # -------------------------
@@ -610,6 +605,10 @@ write_post_login_guide() {
 sed -i 's/robbyrussell/ys/' ~/.zshrc
 sed -i 's/plugins=(git)/plugins=(colored-man-pages colorize cp safe-paste git)/' ~/.zshrc
 sed -i '/export ZSH="\$HOME\/.oh-my-zsh"/a\export PATH=\$PATH:/home/${username}/.local/bin' ~/.zshrc
+EOF
+
+    if "${use_containers}"; then
+        cat <<'EOF' >> "${guide}"
 
 # -------------------------
 # Container Workloads
@@ -667,7 +666,9 @@ sed -i '/export ZSH="\$HOME\/.oh-my-zsh"/a\export PATH=\$PATH:/home/${username}/
 #   and bring down all running containers. Plan for this in your workload
 #   availability strategy, or disable auto-reboot and handle reboots manually.
 EOF
-    chown "${username}:" "/home/${username}/after_first_login.txt"
+    fi
+
+    chown "${username}:" "${guide}"
 }
 
 # Blacklist uncommon filesystems
@@ -1000,7 +1001,9 @@ print_summary() {
     printf "    %s\n" "${Module_Blacklist}"
     printf "    %s\n" "${Sudoers_Drop}"
     printf "    %s\n" "${Umask_Profile}"
-    printf "    %s\n" "${Br_Netfilter_Conf}"
+    if "${use_containers}"; then
+        printf "    %s\n" "${Br_Netfilter_Conf}"
+    fi
     printf "    %s\n" "${Shm_Dropin}"
     printf "    %s\n" "${Journald_Config}"
     printf "    %s\n" "${Logrotate_Config}"
@@ -1010,6 +1013,8 @@ print_summary() {
     printf "\n"
     printf "  Next steps: /home/%s/after_first_login.txt\n" "${username}"
     printf "=========================================================\n"
+    printf "\nPress Enter to exit...\n"
+    read -r
 }
 
 # -------------------------
@@ -1037,7 +1042,10 @@ main() {
     configure_fail2ban
     configure_ssh
     configure_module_blacklist
-    configure_kernel_modules
+    configure_container_firewall
+    if "${use_containers}"; then
+        configure_kernel_modules
+    fi
     configure_sysctl
     configure_auditd_conf
     configure_auditd
@@ -1045,7 +1053,6 @@ main() {
     configure_umask
     configure_lynis
     configure_firewall
-    configure_container_firewall
     configure_shm_hardening
     configure_sudo_log
     configure_su_restriction
