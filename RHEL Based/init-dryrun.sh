@@ -313,11 +313,12 @@ configure_auto_updates() {
             printf "Automatic reboots disabled. You will need to reboot manually after kernel updates.\n"
             ;;
     esac
+    printf "Configuring automatic security updates.\n"
     dryrun "would configure /etc/dnf/automatic.conf with reboot=${reboot_policy}"
 }
 
 configure_pam() {
-    dryrun "would append faillock settings (deny=5, unlock_time=600, fail_interval=900, even_deny_root) to /etc/security/faillock.conf"
+    dryrun "would append faillock settings (deny=5, unlock_time=600, fail_interval=900, even_deny_root, audit) to /etc/security/faillock.conf"
 }
 
 configure_fail2ban() {
@@ -444,7 +445,7 @@ configure_su_restriction() {
 }
 
 configure_auditd_conf() {
-    dryrun "would configure /etc/audit/auditd.conf (space_left_action=email, admin_space_left_action=suspend, max_log_file_action=keep_logs)"
+    dryrun "would configure /etc/audit/auditd.conf (space_left_action=email, admin_space_left_action=suspend, action_mail_acct=root, max_log_file_action=keep_logs)"
     printf "auditd.conf disk space actions configured.\n"
 }
 
@@ -453,7 +454,7 @@ configure_auditd() {
 }
 
 configure_log_retention() {
-    dryrun "would write ${Journald_Config} (MaxRetentionSec=6month, SystemMaxUse=500M)"
+    dryrun "would write ${Journald_Config} (MaxRetentionSec=6month, SystemMaxUse=500M, SystemKeepFree=100M)"
     dryrun "would configure /etc/audit/auditd.conf (max_log_file_action=rotate, num_logs=26)"
     dryrun "would write ${Logrotate_Config} (monthly, rotate 6 for sudo.log and fail2ban.log)"
     printf "Log retention configured: 6 months (journald, auditd, logrotate).\n"
@@ -474,9 +475,7 @@ configure_lynis() {
 configure_aide() {
     dryrun "would append container/K8s path exclusions to /etc/aide.conf"
     printf "Building AIDE database. This may take a few minutes...\n"
-    dryrun "aide --init"
-    dryrun "mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz"
-    printf "[DRY RUN] AIDE database build skipped.\n"
+    dryrun "aide --init (on success: mv aide.db.new.gz to aide.db.gz)"
     dryrun "would write aide-check.service and aide-check.timer to /etc/systemd/system/"
 }
 
@@ -521,7 +520,7 @@ print_summary() {
     printf "    %s\n" "${Logrotate_Config}"
     printf "\n"
     printf "  Backups created with .bak suffix for all modified files.\n"
-    printf "  Run log saved to /var/log/hardening-*.log\n"
+    printf "  [DRY RUN] No run log created.\n"
     printf "\n"
     printf "  Next steps: /home/%s/after_first_login.txt\n" "${username}"
     printf "=========================================================\n"
