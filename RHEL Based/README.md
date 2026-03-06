@@ -149,6 +149,7 @@ UUID=<uuid>  /var   xfs  defaults,nodev,nosuid,x-systemd.device-timeout=0  0 0
 Apply without rebooting:
 
 ```bash
+sudo systemctl daemon-reload
 sudo mount -o remount /var
 sudo mount -o remount /home
 sudo mount -o remount /tmp
@@ -170,7 +171,7 @@ findmnt -o TARGET,OPTIONS /var
 findmnt -o TARGET,OPTIONS /home 
 findmnt -o TARGET,OPTIONS /tmp
 
-# Kubernetes: confirm swap is off
+# Kubernetes: confirm swap is off (should return nothing)
 swapon --show
 ```
 
